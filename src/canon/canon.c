@@ -19,7 +19,7 @@ static inline struct CanonBase *priv(vcam *cam) {
 }
 
 #define EOS_LV_JPEG "bin/eos_liveview.jpg"
-#define EOS_EVENTS_BIN "bin/eos_events.bin"
+#define EOS_EVENTS_BIN "bin/eos/eos_events.bin"
 
 int canon_init_cam(vcam *cam, const char *name, int argc, char **argv) {
 	cam->priv = malloc(sizeof(struct CanonBase));
@@ -88,6 +88,12 @@ static int ptp_eos_generic(vcam *cam, ptpcontainer *ptp) {
 		if (vcam_check_param_count(cam, ptp, 1)) return 1;
 		p->first_events = 1;
 		ptp_response(cam, PTP_RC_OK, 0);
+		return 1;
+	case PTP_OC_EOS_KeepDeviceOn:
+		ptp_response(cam, PTP_RC_OK, 0);
+		return 1;
+	case PTP_OC_EOS_GetRemoteMode:
+		ptp_response(cam, PTP_RC_OK, 1, 0); // untested
 		return 1;
 	}
 
@@ -249,12 +255,19 @@ static int vusb_ptp_eos_events(vcam *cam, ptpcontainer *ptp) {
 		ptp_response(cam, PTP_RC_OK, 0);
 
 		free(buffer);
-
 		p->first_events = 0;
 		return 1;
 	}
 
 	ptp_response(cam, PTP_RC_OK, 0);
+	return 1;
+}
+
+static int vusb_ptp_eos_getdevicepropvalue(vcam *cam, ptpcontainer *ptp) {
+	struct CanonBase *p = priv(cam);
+	if (vcam_check_param_count(cam, ptp, 1)) return 1;
+
+	ptp_response(cam, PTP_RC_GeneralError, 0);
 	return 1;
 }
 
@@ -277,7 +290,7 @@ void canon_register_base_eos(vcam *cam) {
 	vcam_register_opcode(cam, 0x9106,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, PTP_OC_EOS_GetObjectInfoEx,		ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, PTP_OC_EOS_SetDevicePropValueEx,	ptp_eos_set_property, ptp_eos_set_property_data);
-	vcam_register_opcode(cam, PTP_OC_EOS_GetDevicePropValue,		ptp_eos_generic, NULL);
+	vcam_register_opcode(cam, PTP_OC_EOS_GetDevicePropValue, vusb_ptp_eos_getdevicepropvalue, NULL);
 	vcam_register_opcode(cam, 0x910b,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9108,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9109,	ptp_eos_generic, NULL);
@@ -286,7 +299,7 @@ void canon_register_base_eos(vcam *cam) {
 	vcam_register_opcode(cam, 0x910f,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9115,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9114,	ptp_eos_generic, NULL);
-	vcam_register_opcode(cam, 0x9113,	ptp_eos_generic, NULL);
+	vcam_register_opcode(cam, PTP_OC_EOS_GetRemoteMode,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, PTP_OC_EOS_GetEvent,				vusb_ptp_eos_events, NULL);
 	vcam_register_opcode(cam, 0x9117,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9120,	ptp_eos_generic, NULL);
@@ -294,7 +307,7 @@ void canon_register_base_eos(vcam *cam) {
 	vcam_register_opcode(cam, 0x9118,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9121,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x91f1,	ptp_eos_generic, NULL);
-	vcam_register_opcode(cam, 0x911d,	ptp_eos_generic, NULL);
+	vcam_register_opcode(cam, PTP_OC_EOS_KeepDeviceOn,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x910a,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, PTP_OC_EOS_SetUILock,				ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, PTP_OC_EOS_ResetUILock,			ptp_eos_generic, NULL);
@@ -354,7 +367,7 @@ void canon_register_base_eos(vcam *cam) {
 	vcam_register_opcode(cam, 0x906d,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x906e,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x906f,	ptp_eos_generic, NULL);
-	vcam_register_opcode(cam, 0x913d,	ptp_eos_generic, NULL);
+//	vcam_register_opcode(cam, 0x913d,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9180,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9181,	ptp_eos_generic, NULL);
 	vcam_register_opcode(cam, 0x9182,	ptp_eos_generic, NULL);

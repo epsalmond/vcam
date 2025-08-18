@@ -150,6 +150,7 @@ struct PtpIpInitPacket {
 #define PTP_OC_EOS_GetStorageInfo		0x9102
 #define PTP_OC_EOS_GetObjectInfoEx		0x9109
 #define PTP_OC_EOS_SetDevicePropValueEx	0x9110
+#define PTP_OC_EOS_GetRemoteMode		0x9113
 #define PTP_OC_EOS_SetRemoteMode		0x9114
 #define PTP_OC_EOS_SetEventMode			0x9115
 #define PTP_OC_EOS_GetEvent				0x9116

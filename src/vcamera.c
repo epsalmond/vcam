@@ -52,7 +52,7 @@ int vcam_generic_send_file(char *path, vcam *cam, int file_of, ptpcontainer *ptp
 	sprintf(new, "%s/%s", PWD, path);
 	FILE *file = fopen(new, "rb");
 	if (file == NULL) {
-		vcam_panic("vcam_generic_send_file: File %s not found", path);
+		vcam_panic("vcam_generic_send_file: File %s not found", new);
 	}
 
 	fseek(file, 0, SEEK_END);
