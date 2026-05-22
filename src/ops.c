@@ -15,6 +15,7 @@
 #define RAF_MAGIC_LEN 16
 #define RAF_OFFSET_DIRECTORY 0x54
 #define RAF_OFFSET_DIRECTORY_SIZE 24
+#define PTP_MAX_PARTIAL_OBJECT_CHUNK (16u * 1024u * 1024u)
 
 static int jpeg_marker_has_length(unsigned char marker) {
 	if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
@@ -613,6 +614,9 @@ int ptp_getpartialobject_write(vcam *cam, ptpcontainer *ptp) {
 	uint64_t object_size = (uint64_t)cur->stbuf.st_size;
 	uint64_t start = (uint64_t)ptp->params[1];
 	uint64_t requested = (uint64_t)ptp->params[2];
+	if (requested > PTP_MAX_PARTIAL_OBJECT_CHUNK) {
+		requested = PTP_MAX_PARTIAL_OBJECT_CHUNK;
+	}
 	size_t size = 0;
 	if (start < object_size) {
 		uint64_t remaining = object_size - start;
