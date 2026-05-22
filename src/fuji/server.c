@@ -18,15 +18,43 @@
 #include "fuji.h"
 
 static const char *server_ip_address = "192.168.0.1";
+static int first_client_write = 1;
+static int left_of_init_packet = FUJI_ACK_PACKET_SIZE;
+
+static void reset_client_bridge(vcam *cam) {
+	first_client_write = 1;
+	left_of_init_packet = FUJI_ACK_PACKET_SIZE;
+	cam->session = 0;
+	cam->seqnr = 0;
+	cam->nrinbulk = 0;
+	cam->nroutbulk = 0;
+	fuji_reset_image_import_state(cam);
+}
+
+static int recv_exact(int socket, void *buffer, size_t length) {
+	size_t off = 0;
+	while (off < length) {
+		ssize_t rc = recv(socket, (unsigned char *)buffer + off, length - off, 0);
+		if (rc == 0) {
+			return off ? -1 : 0;
+		}
+		if (rc < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		off += (size_t)rc;
+	}
+	return (int)off;
+}
 
 static int ptpip_cmd_client_write(vcam *cam, void *to, int length) {
-	static int first_write = 1;
-
-	if (first_write) {
+	if (first_client_write) {
 		char client_name[100];
 		ptp_read_unicode_string(client_name, ((char *)to) + 28, sizeof(client_name));
 		vcam_log("Connecting to client '%s'", client_name);
-		first_write = 0;
+		first_client_write = 0;
 		return length;
 	}
 
@@ -35,8 +63,6 @@ static int ptpip_cmd_client_write(vcam *cam, void *to, int length) {
 }
 
 static int ptpip_cmd_client_read(vcam *cam, void *to, int length) {
-	static int left_of_init_packet = FUJI_ACK_PACKET_SIZE;
-
 	uint8_t *packet = fuji_get_ack_packet(cam);
 
 	if (left_of_init_packet) {
@@ -49,59 +75,60 @@ static int ptpip_cmd_client_read(vcam *cam, void *to, int length) {
 	return rc;
 }
 
-// Recieve all packets from the app (initiator)
+// Receive one packet from the app (initiator). Returns 1 for clean client close.
 static int tcp_receive_all(vcam *cam, int client_socket) {
-	uint32_t packet_length;
-	ssize_t size;
-	for (int i = 0; i < 10; i++) {
+	uint32_t packet_length = 0;
+	int size;
+	{
 		vcam_log("Receiving data from the client...");
-		size = recv(client_socket, &packet_length, sizeof(uint32_t), 0);
-
+		size = recv_exact(client_socket, &packet_length, sizeof(uint32_t));
 		if (size == 0) {
-			vcam_log("Initiator isn't sending anything, trying again");
-			usleep(1000 * 500);
-			continue;
+			vcam_log("Client closed command socket");
+			return 1;
 		}
-
-		if (size < 0) {
-			perror("Error reading data from socket");
+		if (size != sizeof(uint32_t)) {
+			vcam_log("Couldn't read packet length from client");
 			return -1;
 		}
+	}
 
-		if (size != 4) {
-			vcam_log("Couldn't read 4 bytes, only got %d: %X", size, packet_length);
-
-			size += recv(client_socket, (uint8_t *)(&packet_length) + size, sizeof(uint32_t) - size, 0);
-			if (size == sizeof(uint32_t)) {
-				vcam_log("Acting up, didn't send all of size at first: %X", packet_length);
-				break;
-			}
-			
-			return -1;
+	if (packet_length == 8) {
+		uint32_t sentinel = 0;
+		size = recv_exact(client_socket, &sentinel, sizeof(uint32_t));
+		if (size == sizeof(uint32_t) && sentinel == 0xffffffff) {
+			vcam_log("Image-import command-socket close sentinel received");
+			return 1;
 		}
+		vcam_log("Malformed 8-byte packet on command socket: %08x", sentinel);
+		return -1;
+	}
 
-		break;
+	if (packet_length < 12 || packet_length > (128 * 1024 * 1024)) {
+		vcam_log("Invalid packet length from client: %u", packet_length);
+		return -1;
 	}
 
 	// Allocate the rest of the packet to read
-	uint8_t *buffer = malloc(size + packet_length);
+	uint8_t *buffer = malloc(packet_length);
+	if (!buffer) {
+		return -1;
+	}
 	((uint32_t *)buffer)[0] = packet_length;
 
 	// Continue reading the rest of the data
-	size += recv(client_socket, buffer + size, packet_length - 4, 0);
-
-	if (size < 0) {
-		perror("Error reading data from socket");
-		return -1;
-	} else if (size != packet_length) {
-		vcam_log("Couldn't read the rest of the packet, only got %d out of %d", size, packet_length);
+	size = recv_exact(client_socket, buffer + 4, packet_length - 4);
+	if (size != (int)(packet_length - 4)) {
+		vcam_log("Couldn't read the rest of the packet, only got %d out of %d", size, packet_length - 4);
+		free(buffer);
 		return -1;
 	}
+	size = (int)packet_length;
 
 	// Route the read data into the vcam. The camera is the responder,
 	// and will be the first to write data to the app.
 	int rc = ptpip_cmd_client_write(cam, buffer, size);
 	if (rc != size) {
+		free(buffer);
 		return -1;
 	}
 
@@ -110,29 +137,29 @@ static int tcp_receive_all(vcam *cam, int client_socket) {
 	if (cam->nrinbulk == 0 && c->code != 0x0) {
 		free(buffer);
 
-		size = recv(client_socket, &packet_length, sizeof(uint32_t), 0);
+		size = recv_exact(client_socket, &packet_length, sizeof(uint32_t));
 		if (size != sizeof(uint32_t)) {
 			vcam_log("Failed to receive 4 bytes of data phase response");
 			return -1;
 		}
 
 		// Same trick from the recv part
-		buffer = malloc(size + packet_length);
-		((uint32_t *)buffer)[0] = packet_length;
-		rc = recv(client_socket, buffer + size, packet_length - size, 0);
-		if (rc != packet_length - size) {
-			vcam_log("Failed to receive data phase response");
+		buffer = malloc(packet_length);
+		if (!buffer) {
 			return -1;
 		}
-
-		if (rc != packet_length - size) {
-			vcam_log("Wrote %d, wanted %d", rc, packet_length - size);
+		((uint32_t *)buffer)[0] = packet_length;
+		rc = recv_exact(client_socket, buffer + sizeof(uint32_t), packet_length - sizeof(uint32_t));
+		if (rc != (int)(packet_length - sizeof(uint32_t))) {
+			vcam_log("Failed to receive data phase response");
+			free(buffer);
 			return -1;
 		}
 
 		rc = ptpip_cmd_client_write(cam, buffer, packet_length);
 		if (rc != packet_length) {
 			vcam_log("Failed to send response to vcam");
+			free(buffer);
 			return -1;
 		}
 	}
@@ -211,7 +238,6 @@ static int new_ptp_tcp_socket(int port) {
 	}
 
 	int yes = 1;
-	int no = 0;
 	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) < 0) {
 		perror("Failed to set sockopt");
 	}
@@ -304,7 +330,7 @@ int fuji_wifi_main(vcam *cam) {
 
 	vcam_log("Fuji WiFi vcam - running '%s'", cam->model);
 
-	char *this_ip = malloc(32);
+	char *this_ip = malloc(64);
 	get_local_ip(this_ip);
 
 	// (Skips client datagram discovery)
@@ -344,6 +370,7 @@ int fuji_wifi_main(vcam *cam) {
 		kill(cam->sig, SIGUSR1);
 	}
 
+accept_next_client:;
 	struct sockaddr_in client_address;
 	socklen_t client_address_length = sizeof(client_address);
 	int client_socket = accept(server_socket, (struct sockaddr *)&client_address, &client_address_length);
@@ -354,30 +381,33 @@ int fuji_wifi_main(vcam *cam) {
 		return -1;
 	}
 
+	reset_client_bridge(cam);
 	vcam_log("Connection accepted from %s:%d", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
 
 	while (1) {
-		if (tcp_receive_all(cam, client_socket)) {
-			goto err;
+		int rc = tcp_receive_all(cam, client_socket);
+		if (rc > 0) {
+			break;
+		}
+		if (rc < 0) {
+			vcam_log("Connection forced down");
+			break;
 		}
 
 		// Now the app has sent the data, and is waiting for a response.
 
 		// Read packet length
 		if (tcp_send_all(cam, client_socket)) {
-			goto err;
+			vcam_log("Connection forced down");
+			break;
 		}
 	}
 
 	close(client_socket);
-	vcam_log("Connection closed");
+	vcam_log("Connection closed; waiting for a new client");
+	goto accept_next_client;
+
 	close(server_socket);
 
 	return 0;
-
-err:;
-	puts("Connection forced down");
-	close(client_socket);
-	close(server_socket);
-	return -1;
 }

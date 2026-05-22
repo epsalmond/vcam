@@ -9,7 +9,30 @@
 #include <cl_data.h>
 #include "fuji.h"
 
+#define FUJI_IMPORT_STEP_CLIENT_STATE	0x0001u
+#define FUJI_IMPORT_STEP_DF28_GET	0x0002u
+#define FUJI_IMPORT_STEP_DF28_SET	0x0004u
+#define FUJI_IMPORT_STEP_D226_SET	0x0008u
+#define FUJI_IMPORT_STEP_D227_SET	0x0010u
+#define FUJI_IMPORT_STEP_D244_GET	0x0020u
+#define FUJI_IMPORT_STEP_CURRENT_INFO	0x0040u
+#define FUJI_IMPORT_STEP_CURRENT_THUMB	0x0080u
+#define FUJI_IMPORT_STEP_FOLDERS	0x0100u
+#define FUJI_IMPORT_STEP_DATES		0x0200u
+
 int fuji_usb_init_cam(vcam *cam);
+
+void fuji_reset_image_import_state(vcam *cam) {
+	struct Fuji *f = fuji(cam);
+	if (!f) {
+		return;
+	}
+	f->image_import_preflight_seen = 0;
+	f->image_import_folder_query_seen = 0;
+	f->image_import_date_query_seen = 0;
+	f->image_import_steps = 0;
+	f->image_import_current_handle = 0;
+}
 
 int fuji_init_cam(vcam *cam, const char *name, int argc, char **argv) {
 	cam->priv = calloc(1, sizeof(struct Fuji));
@@ -46,6 +69,13 @@ int fuji_init_cam(vcam *cam, const char *name, int argc, char **argv) {
 		f->remote_get_object_version = 5;
 		// PTP_DPC_FUJI_ImageGetLimitedVersion = 1
 		// PTP_DPC_FUJI_Unknown_D52F = 1
+	} else if (!strcmp(name, "fuji_gfx100_ii") || !strcmp(name, "fuji_gfx100ii") || !strcmp(name, "gfx100ii") || !strcmp(name, "gfx")) {
+		strcpy(cam->model, "GFX100 II");
+		f->image_get_version = 4;
+		f->get_object_version = 5;
+		f->remote_version = 0x0002000c;
+		f->remote_get_object_version = 5;
+		f->is_gfx100ii = 1;
 	} else if (!strcmp(name, "fuji_x_h1")) {
 		strcpy(cam->model, "X-H1");
 		f->image_get_version = 3; // fuji sets to 4
@@ -165,6 +195,7 @@ int vcam_fuji_setup(vcam *cam) {
 	f->no_compressed = 0;
 	f->internal_state = CAM_STATE_READY;
 	f->sent_images = 0;
+	fuji_reset_image_import_state(cam);
 
 	// TODO: Better way to ignore folders (Fuji doesn't show them)
 	f->obj_count = ptp_get_object_count(cam) - 1;
@@ -213,6 +244,21 @@ int fuji_is_compressed_mode(vcam *cam) {
 	return (int)(f->compress_small);
 }
 
+static void fuji_mark_image_import_step(vcam *cam, unsigned int step) {
+	struct Fuji *f = fuji(cam);
+	if (!f->is_gfx100ii) {
+		return;
+	}
+	f->image_import_steps |= step;
+	f->image_import_preflight_seen = 1;
+}
+
+static int ptp_fuji_unsupported(vcam *cam, ptpcontainer *ptp) {
+	vcam_log("Fuji GFX rejecting unsupported opcode 0x%04x", ptp->code);
+	ptp_response(cam, PTP_RC_OperationNotSupported, 0);
+	return 1;
+}
+
 int ptp_fuji_setdevicepropvalue_write(vcam *cam, ptpcontainer *ptp) {
 	int code = ptp->params[0];
 	struct Fuji *f = fuji(cam);
@@ -222,10 +268,12 @@ int ptp_fuji_setdevicepropvalue_write(vcam *cam, ptpcontainer *ptp) {
 		PTP_DPC_FUJI_GetObjectVersion,
 		PTP_DPC_FUJI_EnableCorrectFileSize,
 		PTP_DPC_FUJI_CompressSmall,
+		PTP_DPC_FUJI_Unknown_D22E,
 		PTP_DPC_FUJI_ImageGetVersion,
 		PTP_DPC_FUJI_GeoTagVersion,
 		PTP_DPC_FUJI_AutoSaveVersion,
 		PTP_DPC_FUJI_AutoSaveDatabaseStatus,
+		PTP_DPC_FUJI_RemotePhotoViewExVersion,
 	};
 
 	int codes_remote_only[] = {
@@ -253,13 +301,18 @@ int ptp_fuji_setdevicepropvalue_write_data(vcam *cam, ptpcontainer *ptp, unsigne
 	struct Fuji *f = fuji(cam);
 	uint32_t *uint = (uint32_t *)data;
 	uint16_t *uint16 = (uint16_t *)data;
+	uint32_t log_value = 0;
+	memcpy(&log_value, data, len < sizeof(log_value) ? len : sizeof(log_value));
 
-	vcam_log("Fuji Set property %X -> %X (size %d)", ptp->params[0], uint[0], len);
+	vcam_log("Fuji Set property %X -> %X (size %d)", ptp->params[0], log_value, len);
 
 	switch (ptp->params[0]) {
 	case PTP_DPC_FUJI_ClientState:
 		assert(len == 2);
-		f->client_state = uint[0];
+		f->client_state = uint16[0];
+		if (uint16[0] == 20) {
+			fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_CLIENT_STATE);
+		}
 		//usleep(1000 * 1000 * 3);
 		break;
 	case PTP_DPC_FUJI_RemoteVersion:
@@ -270,15 +323,28 @@ int ptp_fuji_setdevicepropvalue_write_data(vcam *cam, ptpcontainer *ptp, unsigne
 		break;
 	case PTP_DPC_FUJI_CompressSmall:
 		f->compress_small = uint16[0];
+		if (len == 2 && uint16[0] == 0) {
+			fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_D226_SET);
+		}
+		break;
+	case PTP_DPC_FUJI_Unknown_D22E:
 		break;
 	case PTP_DPC_FUJI_EnableCorrectFileSize:
 		assert(len == 2);
 		assert(uint16[0] == 1 || uint16[0] == 0);
 		f->no_compressed = uint16[0];
+		if (uint16[0] == 0) {
+			fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_D227_SET);
+		}
 		//usleep(1000 * 5000); // Fuji seems to take a while here
 		break;
 	case PTP_DPC_FUJI_RemoteGetObjectVersion:
 		assert(len == 4);
+		break;
+	case PTP_DPC_FUJI_RemotePhotoViewExVersion:
+		if (len == 4 && uint[0] == 3) {
+			fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_DF28_SET);
+		}
 		break;
 	case PTP_DPC_FUJI_CameraState:
 		assert(len == 2);
@@ -380,6 +446,11 @@ int ptp_fuji_getdevicepropvalue_write(vcam *cam, ptpcontainer *ptp) {
 		data = f->get_object_version;
 		ptp_senddata(cam, ptp->code, (unsigned char *)&data, 4);
 		} break;
+	case PTP_DPC_FUJI_RemotePhotoViewExVersion:
+		data = 3;
+		fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_DF28_GET);
+		ptp_senddata(cam, ptp->code, (unsigned char *)&data, 4);
+		break;
 	case PTP_DPC_FUJI_RemoteGetObjectVersion:
 		if (f->remote_get_object_version) {
 			data = f->remote_get_object_version;
@@ -388,6 +459,11 @@ int ptp_fuji_getdevicepropvalue_write(vcam *cam, ptpcontainer *ptp) {
 		break;
 //	case PTP_DPC_FUJI_ImageGetLimitedVersion:
 	case PTP_DPC_FUJI_CompressionCutOff:
+		if (f->is_gfx100ii) {
+			data = 0x00bfffe0;
+			ptp_senddata(cam, ptp->code, (unsigned char *)&data, 4);
+			break;
+		}
 		ptp_senddata(cam, ptp->code, (unsigned char *)&data, 0);
 		break;
 	case PTP_DPC_FUJI_RemoteVersion:
@@ -400,6 +476,7 @@ int ptp_fuji_getdevicepropvalue_write(vcam *cam, ptpcontainer *ptp) {
 		break;
 	case PTP_DPC_FUJI_StorageID:
 		data = 0;
+		fuji_mark_image_import_step(cam, FUJI_IMPORT_STEP_D244_GET);
 		ptp_senddata(cam, ptp->code, (unsigned char *)&data, 1);
 		break;
 	case PTP_DPC_FUJI_Unknown_D52F:
@@ -583,6 +660,9 @@ void fuji_register_opcodes(vcam *cam) {
 	vcam_register_opcode(cam, PTP_OC_GetPartialObject, ptp_fuji_getpartialobject_write, NULL);
 
 	struct Fuji *f = fuji(cam);
+	if (f->is_gfx100ii) {
+		vcam_register_opcode(cam, PTP_OC_GetObjectHandles, ptp_fuji_unsupported, NULL);
+	}
 	if (f->do_discovery) {
 		vcam_register_opcode(cam, PTP_OC_GetThumb, ptp_fuji_discovery_getthumb_write, NULL);
 	}
