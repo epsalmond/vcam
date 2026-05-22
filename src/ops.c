@@ -11,6 +11,235 @@
 #include <libexif/exif-data.h>
 #include "vcam.h"
 
+#define RAF_MAGIC "FUJIFILMCCD-RAW "
+#define RAF_MAGIC_LEN 16
+#define RAF_OFFSET_DIRECTORY 0x54
+#define RAF_OFFSET_DIRECTORY_SIZE 24
+
+static int jpeg_marker_has_length(unsigned char marker) {
+	if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
+		return 0;
+	}
+	return 1;
+}
+
+static uint32_t read_be32(const unsigned char *data) {
+	return ((uint32_t)data[0] << 24) |
+	       ((uint32_t)data[1] << 16) |
+	       ((uint32_t)data[2] << 8) |
+	       (uint32_t)data[3];
+}
+
+static int jpeg_find_end(const unsigned char *data, size_t length, size_t start, size_t *end) {
+	if (start + 4 > length || data[start] != 0xff || data[start + 1] != 0xd8) {
+		return 0;
+	}
+	if (data[start + 2] != 0xff) {
+		return 0;
+	}
+
+	size_t offset = start + 2;
+	while (offset + 1 < length) {
+		if (data[offset] != 0xff) {
+			offset++;
+			continue;
+		}
+
+		while (offset < length && data[offset] == 0xff) {
+			offset++;
+		}
+		if (offset >= length) {
+			return 0;
+		}
+
+		unsigned char marker = data[offset++];
+		if (marker == 0xd9) {
+			*end = offset;
+			return 1;
+		}
+		if (marker == 0x00 || !jpeg_marker_has_length(marker)) {
+			continue;
+		}
+		if (offset + 2 > length) {
+			return 0;
+		}
+
+		size_t segment_length = ((size_t)data[offset] << 8) | data[offset + 1];
+		if (segment_length < 2 || offset + segment_length > length) {
+			return 0;
+		}
+
+		if (marker == 0xda) {
+			offset += segment_length;
+			while (offset + 1 < length) {
+				if (data[offset] == 0xff && data[offset + 1] == 0xd9) {
+					*end = offset + 2;
+					return 1;
+				}
+				offset++;
+			}
+			return 0;
+		}
+
+		offset += segment_length;
+	}
+
+	return 0;
+}
+
+static int jpeg_get_dimensions(const unsigned char *data, size_t length, int *width, int *height) {
+	size_t offset = 2;
+	while (offset + 3 < length) {
+		if (data[offset] != 0xff) {
+			offset++;
+			continue;
+		}
+		while (offset < length && data[offset] == 0xff) {
+			offset++;
+		}
+		if (offset >= length) {
+			return 0;
+		}
+
+		unsigned char marker = data[offset++];
+		if (marker == 0xda || marker == 0xd9) {
+			return 0;
+		}
+		if (marker == 0x00 || !jpeg_marker_has_length(marker)) {
+			continue;
+		}
+		if (offset + 2 > length) {
+			return 0;
+		}
+
+		size_t segment_length = ((size_t)data[offset] << 8) | data[offset + 1];
+		if (segment_length < 2 || offset + segment_length > length) {
+			return 0;
+		}
+
+		if ((marker >= 0xc0 && marker <= 0xc3) ||
+		    (marker >= 0xc5 && marker <= 0xc7) ||
+		    (marker >= 0xc9 && marker <= 0xcb) ||
+		    (marker >= 0xcd && marker <= 0xcf)) {
+			if (segment_length >= 7) {
+				*height = (data[offset + 3] << 8) | data[offset + 4];
+				*width = (data[offset + 5] << 8) | data[offset + 6];
+				return 1;
+			}
+			return 0;
+		}
+
+		offset += segment_length;
+	}
+
+	return 0;
+}
+
+static int jpeg_extract_exif_thumbnail(const unsigned char *jpeg, size_t jpeg_size, unsigned char **thumb, size_t *thumb_size) {
+	ExifData *ed = exif_data_new_from_data(jpeg, jpeg_size);
+	if (!ed) {
+		return 0;
+	}
+	if (!ed->data || !ed->size) {
+		exif_data_unref(ed);
+		return 0;
+	}
+
+	size_t end = 0;
+	if (!jpeg_find_end(ed->data, ed->size, 0, &end) || end != ed->size) {
+		exif_data_unref(ed);
+		return 0;
+	}
+
+	*thumb_size = ed->size;
+	if (thumb) {
+		*thumb = malloc(ed->size);
+		if (!*thumb) {
+			*thumb_size = 0;
+			exif_data_unref(ed);
+			return 0;
+		}
+		memcpy(*thumb, ed->data, ed->size);
+	}
+
+	exif_data_unref(ed);
+	return 1;
+}
+
+static int raf_get_preview_range(const unsigned char *filedata, size_t file_size, size_t *preview_start, size_t *preview_size) {
+	if (file_size < RAF_OFFSET_DIRECTORY + RAF_OFFSET_DIRECTORY_SIZE) {
+		return 0;
+	}
+	if (memcmp(filedata, RAF_MAGIC, RAF_MAGIC_LEN) != 0) {
+		return 0;
+	}
+
+	/* Reference: libopenraw RafContainer::_readHeader() documents this fixed RAF
+	 * header directory as big-endian JPEG/META/CFA offset-length pairs.
+	 * https://libopenraw.freedesktop.org/api/libopenraw/stable/rafcontainer_8cpp_source.html
+	 */
+	uint32_t jpeg_offset = read_be32(filedata + RAF_OFFSET_DIRECTORY);
+	uint32_t jpeg_length = read_be32(filedata + RAF_OFFSET_DIRECTORY + 4);
+	if (!jpeg_offset || !jpeg_length || jpeg_offset > file_size || jpeg_length > file_size - jpeg_offset) {
+		return 0;
+	}
+
+	size_t end = 0;
+	if (!jpeg_find_end(filedata, (size_t)jpeg_offset + jpeg_length, jpeg_offset, &end)) {
+		return 0;
+	}
+	if (end <= jpeg_offset || end > (size_t)jpeg_offset + jpeg_length) {
+		return 0;
+	}
+
+	*preview_start = jpeg_offset;
+	*preview_size = end - jpeg_offset;
+	return 1;
+}
+
+static int raf_extract_embedded_jpeg(struct ptp_dirent *cur, unsigned char **thumb, size_t *thumb_size, int *width, int *height) {
+	if (thumb) {
+		*thumb = NULL;
+	}
+	*thumb_size = 0;
+
+	size_t file_size = (size_t)cur->stbuf.st_size;
+	unsigned char *filedata = read_file(cur);
+	if (!filedata) {
+		return 0;
+	}
+
+	size_t preview_start = 0;
+	size_t preview_size = 0;
+	if (!raf_get_preview_range(filedata, file_size, &preview_start, &preview_size)) {
+		free(filedata);
+		return 0;
+	}
+
+	if (width && height) {
+		jpeg_get_dimensions(filedata + preview_start, preview_size, width, height);
+	}
+
+	if (jpeg_extract_exif_thumbnail(filedata + preview_start, preview_size, thumb, thumb_size)) {
+		free(filedata);
+		return 1;
+	}
+
+	*thumb_size = preview_size;
+	if (thumb) {
+		*thumb = malloc(preview_size);
+		if (!*thumb) {
+			*thumb_size = 0;
+			free(filedata);
+			return 0;
+		}
+		memcpy(*thumb, filedata + preview_start, preview_size);
+	}
+
+	free(filedata);
+	return 1;
+}
+
 int ptp_nikon_setcontrolmode_write(vcam *cam, ptpcontainer *ptp) {
 	if (vcam_check_param_count(cam, ptp, 1))return 1;
 
@@ -377,27 +606,44 @@ int ptp_getpartialobject_write(vcam *cam, ptpcontainer *ptp) {
 	FILE *file = fopen(cur->fsname, "rb");
 	if (file == NULL) {
 		vcam_log("File %s not found", cur->fsname);
-		exit(-1);
-	}
-
-	size_t start = (size_t)ptp->params[1];
-	size_t size = (size_t)ptp->params[2];
-
-	if (fseek(file, start, SEEK_SET) == -1) {
-		ptp_response(cam, PTP_RC_OK, 0);
+		ptp_response(cam, PTP_RC_GeneralError, 0);
 		return 1;
 	}
 
-	char *buffer = malloc(size);
-	int read = fread(buffer, 1, size, file); // TODO: check for folder
+	uint64_t object_size = (uint64_t)cur->stbuf.st_size;
+	uint64_t start = (uint64_t)ptp->params[1];
+	uint64_t requested = (uint64_t)ptp->params[2];
+	size_t size = 0;
+	if (start < object_size) {
+		uint64_t remaining = object_size - start;
+		uint64_t to_read = requested < remaining ? requested : remaining;
+		if (to_read > SIZE_MAX) {
+			to_read = SIZE_MAX;
+		}
+		size = (size_t)to_read;
+	}
 
-	ptp_senddata(cam, ptp->code, (unsigned char *)buffer, read);
-	vcam_log("Generic sending %d", read);
+	if (size && fseek(file, (long)start, SEEK_SET) == -1) {
+		fclose(file);
+		ptp_response(cam, PTP_RC_GeneralError, 0);
+		return 1;
+	}
+
+	char *buffer = size ? malloc(size) : NULL;
+	if (size && !buffer) {
+		fclose(file);
+		ptp_response(cam, PTP_RC_GeneralError, 0);
+		return 1;
+	}
+	size_t bytes_read = size ? fread(buffer, 1, size, file) : 0; // TODO: check for folder
+
+	ptp_senddata(cam, ptp->code, (unsigned char *)buffer, (int)bytes_read);
+	vcam_log("Generic sending %d", (int)bytes_read);
 
 	free(buffer);
 	fclose(file);
 
-	ptp_response(cam, PTP_RC_OK, 0);
+	ptp_response(cam, PTP_RC_OK, 1, (uint32_t)bytes_read);
 	return 1;
 }
 
@@ -476,6 +722,11 @@ int ptp_getobjectinfo_write(vcam *cam, ptpcontainer *ptp) {
 		if (strstr(cur->name, ".MPG") || strstr(cur->name, ".mpg") ||
 		    strstr(cur->name, ".MPEG") || strstr(cur->name, ".mpeg"))
 			ofc = 0x300B;
+		if (strstr(cur->name, ".MOV") || strstr(cur->name, ".mov") ||
+		    strstr(cur->name, ".MP4") || strstr(cur->name, ".mp4"))
+			ofc = PTP_OF_MOV;
+		if (strstr(cur->name, ".RAF") || strstr(cur->name, ".raf"))
+			ofc = PTP_OF_RAF;
 	}
 
 	if (ofc == 0x3801) { /* We are jpeg ... look into the exif data */
@@ -519,9 +770,15 @@ int ptp_getobjectinfo_write(vcam *cam, ptpcontainer *ptp) {
 		}
 		exif_data_unref(ed);
 		free(filedata);
+	} else if (ofc == PTP_OF_RAF) {
+		size_t raf_thumb_size = 0;
+		if (raf_extract_embedded_jpeg(cur, NULL, &raf_thumb_size, &imagewidth, &imageheight)) {
+			thumbofc = 0x3808;
+			thumbsize = (int)raf_thumb_size;
+		}
 	}
 
-	uint32_t compressed_size = cur->stbuf.st_size;
+	uint32_t compressed_size = cur->stbuf.st_size > UINT32_MAX ? UINT32_MAX : (uint32_t)cur->stbuf.st_size;
 
 #warning "TODO: compressed_size = 0x19000 if fuji is in wifi mode"
 
@@ -570,7 +827,7 @@ int ptp_getobjectinfo_write(vcam *cam, ptpcontainer *ptp) {
 		x += put_string(data + x, "Orientation: 1");
 	}
 
-	ptp_senddata(cam, 0x1008, data, x);
+	ptp_senddata(cam, ptp->code, data, x);
 	free(data);
 	ptp_response(cam, PTP_RC_OK, 0);
 	return 1;
@@ -634,6 +891,21 @@ int ptp_getthumb_write(vcam *cam, ptpcontainer *ptp) {
 		ptp_response(cam, PTP_RC_InvalidObjectHandle, 0);
 		return 1;
 	}
+	if (strstr(cur->name, ".RAF") || strstr(cur->name, ".raf")) {
+		size_t raf_thumb_size = 0;
+		unsigned char *raf_thumb = NULL;
+		if (!raf_extract_embedded_jpeg(cur, &raf_thumb, &raf_thumb_size, NULL, NULL)) {
+			vcam_log_func(__func__, "RAF does not contain an embedded JPEG thumbnail");
+			ptp_response(cam, PTP_RC_NoThumbnailPresent, 0);
+			return 1;
+		}
+
+		ptp_senddata(cam, ptp->code, raf_thumb, (int)raf_thumb_size);
+		free(raf_thumb);
+		ptp_response(cam, PTP_RC_OK, 0);
+		vcam_log("Done processing RAF thumbnail call\n");
+		return 1;
+	}
 	data = read_file(cur);
 	if (!data) {
 		ptp_response(cam, PTP_RC_GeneralError, 0);
@@ -658,7 +930,7 @@ int ptp_getthumb_write(vcam *cam, ptpcontainer *ptp) {
 	 * We found a thumbnail in EXIF data! Those
 	 * thumbnails are always JPEG. Set up the file.
 	 */
-	ptp_senddata(cam, 0x100A, ed->data, ed->size);
+	ptp_senddata(cam, ptp->code, ed->data, ed->size);
 	exif_data_unref(ed);
 
 	ptp_response(cam, PTP_RC_OK, 0);

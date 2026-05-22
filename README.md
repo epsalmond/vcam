@@ -67,6 +67,11 @@ See the makefile for more info on starting access points.
 make ap-canon WIFI_DEV=wlan0
 ```
 
+## gfxii100 additions
+- Some propietary fuji changes in modern bodies
+- We send the RAF file's thumbnail (not the same as the embedded jpg render)
+- Probably works for any "modern" fuji
+
 ## Credits
 Original Author (vusb): Marcus Meissner <marcus@jet.franken.de>  
 Forked from https://github.com/gphoto/libgphoto2/tree/master/libgphoto2_port/vusb  
