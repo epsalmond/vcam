@@ -179,11 +179,15 @@ static int tcp_send_all(vcam *cam, int client_socket) {
 
 	// Same trick from the recv part
 	char *buffer = malloc(size + packet_length);
+	if (!buffer) {
+		return -1;
+	}
 	((uint32_t *)buffer)[0] = packet_length;
 	int rc = ptpip_cmd_client_read(cam, buffer + size, packet_length - size);
 
 	if (rc != packet_length - size) {
 		vcam_log("Read %d, wanted %d", rc, packet_length - size);
+		free(buffer);
 		return -1;
 	}
 
@@ -191,28 +195,37 @@ static int tcp_send_all(vcam *cam, int client_socket) {
 	size = send(client_socket, buffer, packet_length, 0);
 	if (size <= 0) {
 		perror("Error sending data to client");
+		free(buffer);
 		return -1;
 	}
 
 	// As per spec, data phase must have a 12 byte packet following
 	struct PtpBulkContainer *c = (struct PtpBulkContainer *)buffer;
-	if (c->type == PTP_PACKET_TYPE_DATA && c->code != 0x0) {
+	int sent_data_phase = c->type == PTP_PACKET_TYPE_DATA && c->code != 0x0;
+	uint16_t sent_code = c->code;
+	free(buffer);
+	buffer = NULL;
+	if (sent_data_phase) {
 
 		// Read packet length
 		size = ptpip_cmd_client_read(cam, &packet_length, 4);
 		if (size != 4) {
 			vcam_log("response packet: vcam failed to provide 4 bytes: %d", size);
-			vcam_log("Code: %X", c->code);
+			vcam_log("Code: %X", sent_code);
 			return -1;
 		}
 
 		// Same trick from the recv part
 		buffer = malloc(size + packet_length);
+		if (!buffer) {
+			return -1;
+		}
 		((uint32_t *)buffer)[0] = packet_length;
 		rc = ptpip_cmd_client_read(cam, buffer + size, packet_length - size);
 
 		if (rc != packet_length - size) {
 			vcam_log("Read %d, wanted %d", rc, packet_length - size);
+			free(buffer);
 			return -1;
 		}
 
@@ -220,6 +233,7 @@ static int tcp_send_all(vcam *cam, int client_socket) {
 		size = send(client_socket, buffer, packet_length, 0);
 		if (size <= 0) {
 			perror("Error sending data to client");
+			free(buffer);
 			return -1;
 		}
 	}
