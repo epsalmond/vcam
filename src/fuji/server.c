@@ -3,6 +3,7 @@
 // Copyright Daniel C - GNU Lesser General Public License v2.1
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,14 @@
 static const char *server_ip_address = "192.168.0.1";
 static int first_client_write = 1;
 static int left_of_init_packet = FUJI_ACK_PACKET_SIZE;
+
+static void format_sockaddr(const struct sockaddr *addr, socklen_t addrlen, char *host, size_t host_len, char *service, size_t service_len) {
+	int rc = getnameinfo(addr, addrlen, host, host_len, service, service_len, NI_NUMERICHOST | NI_NUMERICSERV);
+	if (rc) {
+		snprintf(host, host_len, "<unknown>");
+		snprintf(service, service_len, "0");
+	}
+}
 
 static void reset_client_bridge(vcam *cam) {
 	first_client_write = 1;
@@ -244,49 +253,66 @@ static int tcp_send_all(vcam *cam, int client_socket) {
 }
 
 static int new_ptp_tcp_socket(int port) {
-	int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+	char service[16];
+	snprintf(service, sizeof(service), "%d", port);
 
-	if (server_socket == -1) {
-		perror("Socket creation failed");
-		abort();
-	}
+	struct addrinfo hints;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
 
-	int yes = 1;
-	if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) < 0) {
-		perror("Failed to set sockopt");
-	}
-
-	if (setsockopt(server_socket, SOL_SOCKET, TCP_QUICKACK, &yes, sizeof(int)) < 0) {
-		perror("Failed to set sockopt");
-	}
-
-	if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) < 0) {
-		perror("Failed to set sockopt");
-	}
-
-	struct sockaddr_in serverAddress;
-	memset(&serverAddress, 0, sizeof(serverAddress));
-	serverAddress.sin_family = AF_INET;
-	serverAddress.sin_addr.s_addr = inet_addr(server_ip_address);
-	serverAddress.sin_port = htons(port);
-
-
-	vcam_log("Binding to %s:%d", server_ip_address, port);
-
-	if (bind(server_socket, (struct sockaddr *)&serverAddress, sizeof(serverAddress)) == -1) {
-		perror("Bind failed");
-		close(server_socket);
+	struct addrinfo *result = NULL;
+	int rc = getaddrinfo(server_ip_address, service, &hints, &result);
+	if (rc) {
+		vcam_log("Failed to resolve bind address %s:%d: %s", server_ip_address, port, gai_strerror(rc));
 		return -1;
 	}
 
-	if (listen(server_socket, 5) == -1) {
-		perror("Listening failed");
-		close(server_socket);
-		return -1;
+	int server_socket = -1;
+	for (struct addrinfo *cur = result; cur; cur = cur->ai_next) {
+		server_socket = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
+		if (server_socket == -1) {
+			continue;
+		}
+
+		int yes = 1;
+		if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) < 0) {
+			perror("Failed to set sockopt");
+		}
+
+		if (setsockopt(server_socket, SOL_SOCKET, TCP_QUICKACK, &yes, sizeof(int)) < 0) {
+			perror("Failed to set sockopt");
+		}
+
+		if (setsockopt(server_socket, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) < 0) {
+			perror("Failed to set sockopt");
+		}
+
+		char host[NI_MAXHOST];
+		char port_name[NI_MAXSERV];
+		format_sockaddr(cur->ai_addr, cur->ai_addrlen, host, sizeof(host), port_name, sizeof(port_name));
+		vcam_log("Binding to %s:%s", host, port_name);
+
+		if (bind(server_socket, cur->ai_addr, cur->ai_addrlen) == -1) {
+			perror("Bind failed");
+			close(server_socket);
+			server_socket = -1;
+			continue;
+		}
+
+		if (listen(server_socket, 5) == -1) {
+			perror("Listening failed");
+			close(server_socket);
+			server_socket = -1;
+			continue;
+		}
+
+		vcam_log("Socket listening on %s:%s...", host, port_name);
+		break;
 	}
 
-	vcam_log("Socket listening on %s:%d...", server_ip_address, port);
-
+	freeaddrinfo(result);
 	return server_socket;
 }
 
@@ -296,7 +322,7 @@ static void *fuji_accept_remote_ports_thread(void *arg) {
 	int event_socket = new_ptp_tcp_socket(FUJI_EVENT_IP_PORT);
 	int video_socket = new_ptp_tcp_socket(FUJI_LIVEVIEW_IP_PORT);
 
-	struct sockaddr_in client_address_event;
+	struct sockaddr_storage client_address_event;
 	socklen_t client_address_length_event = sizeof(client_address_event);
 	int client_socket_event = accept(event_socket, (struct sockaddr *)&client_address_event, &client_address_length_event);
 	if (client_socket_event == -1) {
@@ -304,9 +330,12 @@ static void *fuji_accept_remote_ports_thread(void *arg) {
 		abort();
 	}
 
-	vcam_log("Event port connection accepted from %s:%d", inet_ntoa(client_address_event.sin_addr), ntohs(client_address_event.sin_port));
+	char client_host[NI_MAXHOST];
+	char client_port[NI_MAXSERV];
+	format_sockaddr((struct sockaddr *)&client_address_event, client_address_length_event, client_host, sizeof(client_host), client_port, sizeof(client_port));
+	vcam_log("Event port connection accepted from %s:%s", client_host, client_port);
 
-	struct sockaddr_in client_address_video;
+	struct sockaddr_storage client_address_video;
 	socklen_t client_address_length_video = sizeof(client_address_video);
 	int client_socket_video = accept(video_socket, (struct sockaddr *)&client_address_video, &client_address_length_video);
 	if (client_socket_video == -1) {
@@ -314,7 +343,8 @@ static void *fuji_accept_remote_ports_thread(void *arg) {
 		abort();
 	}
 
-	vcam_log("Video port connection accepted from %s:%d", inet_ntoa(client_address_video.sin_addr), ntohs(client_address_video.sin_port));
+	format_sockaddr((struct sockaddr *)&client_address_video, client_address_length_video, client_host, sizeof(client_host), client_port, sizeof(client_port));
+	vcam_log("Video port connection accepted from %s:%s", client_host, client_port);
 
 	// TODO: Do this continuously with two frames? 
 	ptp_fuji_liveview(client_socket_video);
@@ -385,7 +415,7 @@ int fuji_wifi_main(vcam *cam) {
 	}
 
 accept_next_client:;
-	struct sockaddr_in client_address;
+	struct sockaddr_storage client_address;
 	socklen_t client_address_length = sizeof(client_address);
 	int client_socket = accept(server_socket, (struct sockaddr *)&client_address, &client_address_length);
 
@@ -396,7 +426,10 @@ accept_next_client:;
 	}
 
 	reset_client_bridge(cam);
-	vcam_log("Connection accepted from %s:%d", inet_ntoa(client_address.sin_addr), ntohs(client_address.sin_port));
+	char client_host[NI_MAXHOST];
+	char client_port[NI_MAXSERV];
+	format_sockaddr((struct sockaddr *)&client_address, client_address_length, client_host, sizeof(client_host), client_port, sizeof(client_port));
+	vcam_log("Connection accepted from %s:%s", client_host, client_port);
 
 	while (1) {
 		int rc = tcp_receive_all(cam, client_socket);
