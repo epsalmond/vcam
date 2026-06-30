@@ -296,7 +296,6 @@ struct PtpIpInitPacket {
 #define PTP_OF_MPEG				0x300B
 #define PTP_OF_ASF				0x300C
 #define PTP_OF_MOV				0x300D
-#define PTP_OF_RAF				0xB103
 #define PTP_OF_IMAGE			0x3800
 #define PTP_OF_JPEG				0x3801
 #define PTP_OF_TIFF_EP			0x3802

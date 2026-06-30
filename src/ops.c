@@ -574,10 +574,10 @@ int ptp_getobjectinfo_write(vcam *cam, ptpcontainer *ptp) {
 		    strstr(cur->name, ".MP4") || strstr(cur->name, ".mp4"))
 			ofc = PTP_OF_MOV;
 		if (strstr(cur->name, ".RAF") || strstr(cur->name, ".raf"))
-			ofc = PTP_OF_RAF;
+			ofc = PTP_OF_RAW;
 	}
 
-	if (ofc == PTP_OF_JPEG || ofc == PTP_OF_RAF) {
+	if (ofc == PTP_OF_JPEG || ofc == PTP_OF_RAW) {
 		size_t exif_thumb_size = 0;
 		if (exif_read_object_metadata(cur, NULL, &exif_thumb_size, &imagewidth, &imageheight)) {
 			thumbofc = 0x3808;
